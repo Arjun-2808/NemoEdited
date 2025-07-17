@@ -29,6 +29,8 @@ from pytorch_lightning import Trainer
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
+from nemo.collections.asr.parts.mixins.diarization import RawAudioDataset
+
 from nemo.collections.asr.data.audio_to_diar_label import AudioToSpeechE2ESpkDiarDataset
 from nemo.collections.asr.data.audio_to_diar_label_lhotse import LhotseAudioToSpeechE2ESpkDiarDataset
 from nemo.collections.asr.metrics.multi_binary_acc import MultiBinaryAccuracy
@@ -342,22 +344,22 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
 
     def _diarize_forward(self, batch: Any):
         """
-        A counterpart of `_transcribe_forward` function in ASR.
-        This function is a wrapper for forward pass functions for compataibility
-        with the existing classes.
-
-        Args:
-            batch (Any): The input batch containing audio signal and audio signal length.
-
-        Returns:
-            preds (torch.Tensor): Sorted tensor containing Sigmoid values for predicted speaker labels.
-                Shape: (batch_size, diar_frame_count, num_speakers)
+        Forward pass that handles both raw-arrays (list of dicts) and NeMo batches (tuple).
         """
         with torch.no_grad():
-            preds = self.forward(audio_signal=batch[0], audio_signal_length=batch[1])
-            preds = preds.to('cpu')
-            torch.cuda.empty_cache()
-        return preds
+            # raw-array case
+            if isinstance(batch, list) and isinstance(batch[0], dict) and 'audio_signal' in batch[0]:
+                signals = [item['audio_signal'] for item in batch]
+                lengths = torch.tensor([s.shape[0] for s in signals], dtype=torch.long)
+                padded = torch.nn.utils.rnn.pad_sequence(signals, batch_first=True)
+                preds = self.forward(audio_signal=padded, audio_signal_length=lengths)
+            else:
+                # existing tuple-based case
+                preds = self.forward(audio_signal=batch[0], audio_signal_length=batch[1])
+
+            return preds.to('cpu')
+
+
 
     def _diarize_output_processing(
         self, outputs, uniq_ids, diarcfg: DiarizeConfig
@@ -414,17 +416,18 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             return diar_output_lines_list
 
     def _setup_diarize_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
-        """
-        Setup function for a temporary data loader which wraps the provided audio file.
+        # ---- new raw-audio branch ----
+        if 'raw_audio_arrays' in config:
+            dataset = RawAudioDataset(config['raw_audio_arrays'], config['uniq_ids'])
+            return DataLoader(
+                dataset,
+                batch_size=config.get('batch_size', 1),
+                shuffle=False,
+                num_workers=config.get('num_workers', 0),
+                collate_fn=lambda x: x,
+            )
 
-        Args:
-            config: A python dictionary which contains the following keys:
-            - manifest_filepath: Path to the manifest file containing audio file paths
-              and corresponding speaker labels.
-
-        Returns:
-            A pytorch DataLoader for the given audio file(s).
-        """
+        # ---- existing file-based logic unchanged ----
         if 'manifest_filepath' in config:
             manifest_filepath = config['manifest_filepath']
             batch_size = config['batch_size']
@@ -443,8 +446,9 @@ class SortformerEncLabelModel(ModelPT, ExportableEncDecModel, SpkDiarizationMixi
             'num_workers': config.get('num_workers', min(batch_size, os.cpu_count() - 1)),
             'pin_memory': True,
         }
-        temporary_datalayer = self.__setup_dataloader_from_config(config=DictConfig(dl_config))
-        return temporary_datalayer
+        return self.__setup_dataloader_from_config(config=DictConfig(dl_config))
+
+
 
     def oom_safe_feature_extraction(self, input_signal, input_signal_length):
         """

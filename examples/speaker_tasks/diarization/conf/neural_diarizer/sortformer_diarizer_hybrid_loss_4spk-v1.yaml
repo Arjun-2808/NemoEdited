@@ -158,7 +158,7 @@ model:
 trainer:
   devices: 1 # number of gpus (devices)
   accelerator: gpu 
-  max_epochs: 800
+  max_epochs: 50
   max_steps: -1 # computed at runtime if not set
   num_nodes: 1
   strategy: ddp_find_unused_parameters_true # Could be "ddp"

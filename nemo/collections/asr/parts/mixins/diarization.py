@@ -21,6 +21,23 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
+
+from torch.utils.data import Dataset
+
+class RawAudioDataset(Dataset):
+    def __init__(self, audio_arrays, uniq_ids):
+        self.audio_arrays = audio_arrays
+        self.uniq_ids = uniq_ids
+
+    def __len__(self):
+        return len(self.audio_arrays)
+
+    def __getitem__(self, idx):
+        return {
+            'audio_signal': torch.tensor(self.audio_arrays[idx], dtype=torch.float32),
+            'uniq_id': self.uniq_ids[idx]
+        }
+
 from tqdm import tqdm
 
 from nemo.collections.asr.parts.utils.speaker_utils import audio_rttm_map, get_uniqname_from_filepath
@@ -344,48 +361,76 @@ class SpkDiarizationMixin(ABC):
         logging.set_verbosity(logging.WARNING)
 
     def _diarize_input_processing(self, audio, diarcfg: DiarizeConfig):
-        """
-        Internal function to process the input audio data and return a DataLoader. This function is called by
-        `diarize()` and `diarize_generator()` to setup the input data for diarization.
-
-        Args:
-            audio: Of type `GenericDiarizationType`
-            diarcfg: The diarization config dataclass. Subclasses can change this to a different dataclass if needed.
-
-        Returns:
-            A DataLoader object that is used to iterate over the input audio data.
-        """
-        if isinstance(audio, (list, tuple)):
-            if len(audio) == 0:
-                raise ValueError("Input `audio` is empty")
-        else:
-            # Assume it is a single variable, so wrap it in a list
-            audio = [audio]
-
-        # Check if audio is a list of strings (filepaths or manifests)
-        if isinstance(audio[0], str):
-            if len(audio) == 1 and audio[0].endswith('.json') or audio[0].endswith('.jsonl'):
-                # Assume it is a path to a manifest file
-                diarcfg._internal.manifest_filepath = audio[0]
-                self._diarize_audio_rttm_map = audio_rttm_map(audio[0])
-                audio_files = []
-                for uniq_id, meta_dict in self._diarize_audio_rttm_map.items():
-                    audio_files.append(meta_dict['audio_filepath'])
+            """
+            Internal function to process the input audio data and return a DataLoader.
+            Now supports both file-path inputs (str) and in-memory NumPy arrays.
+            """
+            # Wrap single inputs into a list
+            if isinstance(audio, (list, tuple)):
+                if len(audio) == 0:
+                    raise ValueError("Input `audio` is empty")
             else:
-                # Make `audio_files` a list of audio file paths
-                audio_files = list(audio)
-                self._diarize_audio_rttm_map = self._input_audio_to_rttm_processing(audio_files=audio_files)
+                audio = [audio]
 
-            tmp_dir = diarcfg._internal.temp_dir
-            ds_config = self._diarize_input_manifest_processing(audio_files, tmp_dir, diarcfg)
+            # Case 1: file‐based input
+            if isinstance(audio[0], str):
+                if len(audio) == 1 and (audio[0].endswith('.json') or audio[0].endswith('.jsonl')):
+                    diarcfg._internal.manifest_filepath = audio[0]
+                    self._diarize_audio_rttm_map = audio_rttm_map(audio[0])
+                    audio_files = [
+                        meta['audio_filepath'] 
+                        for meta in self._diarize_audio_rttm_map.values()
+                    ]
+                else:
+                    audio_files = list(audio)
+                    self._diarize_audio_rttm_map = self._input_audio_to_rttm_processing(
+                        audio_files=audio_files
+                    )
 
-            temp_dataloader = self._setup_diarize_dataloader(ds_config)
-            return temp_dataloader
+                tmp_dir = diarcfg._internal.temp_dir
+                ds_config = self._diarize_input_manifest_processing(
+                    audio_files, tmp_dir, diarcfg
+                )
+                return self._setup_diarize_dataloader(ds_config)
 
-        else:
-            raise ValueError(
-                f"Input `audio` is of type {type(audio[0])}. " "Only `str` (path to audio file) is supported as input."
-            )
+            # Case 2: raw NumPy‐array input
+            elif isinstance(audio[0], np.ndarray):
+                self._diarize_audio_rttm_map = {}
+                uniq_ids = []
+                for idx, arr in enumerate(audio):
+                    uid = f'array_{idx}'
+                    uniq_ids.append(uid)
+                    self._diarize_audio_rttm_map[uid] = {
+                        'uniq_id': uid,
+                        'audio': arr,
+                        'offset': 0.0,
+                        'duration': arr.shape[0] / 16000.0,  # adjust if SR ≠ 16k
+                        'text': '-',
+                        'label': 'infer',
+                    }
+
+                ds_config = {
+                    'raw_audio_arrays': audio,
+                    'uniq_ids': uniq_ids,
+                    'batch_size': get_value_from_diarization_config(diarcfg, 'batch_size', 1),
+                    'session_len_sec': get_value_from_diarization_config(
+                        diarcfg, 'session_len_sec', diarcfg.session_len_sec
+                    ),
+                    'num_workers': get_value_from_diarization_config(
+                        diarcfg, 'num_workers', 1
+                    ),
+                }
+                return self._setup_diarize_dataloader(ds_config)
+
+            # Anything else is unsupported
+            else:
+                raise ValueError(
+                    f"Input `audio` is of type {type(audio[0])}. "
+                    "Only file paths (`str`) or in-memory NumPy arrays (`np.ndarray`) are supported."
+                )
+
+
+        
 
     def _diarize_input_manifest_processing(
         self, audio_files: List[str], temp_dir: str, diarcfg: DiarizeConfig
