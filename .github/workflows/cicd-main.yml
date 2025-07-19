@@ -13,14 +13,14 @@
 # limitations under the License.
 name: CICD NeMo
 on:
-  schedule:
-    - cron: 0 0 * * *
-  pull_request:
-    branches:
-      - main
-      - r**
-      - weekly-bump*
-    types: [labeled]
+#  schedule:
+ #   - cron: 0 0 * * *
+  #pull_request:
+   # branches:
+    #  - main
+     # - r**
+      #- weekly-bump*
+    #types: [labeled]
   workflow_dispatch:
     inputs:
       test_to_run:
